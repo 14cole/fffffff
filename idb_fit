@@ -1,0 +1,303 @@
+"""Lightweight Debye/Lorentz fitters (work-in-progress).
+
+Implements a simple coordinate-descent optimizer to approximate the legacy
+Fortran CE2DB1/2/3 style least-square fits. Supports:
+  - Single Debye (IDBKODE digit 1)
+  - Double Debye (digit 3)
+  - Triple Debye (digit 5)
+
+Controls follow the same conventions:
+  control = 0   -> estimate freely (initial guess from data)
+  control > 0   -> fixed at that value (1e-8 is treated as zero)
+  control < 0   -> use abs(control) as initial guess, free to move
+
+NOTE: This is an initial port and may diverge from the precise Fortran search
+heuristics. It is intended as a starting point for parity refinement.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, List, Sequence, Tuple
+
+import numpy as np
+
+import debye
+import lorentz
+
+
+@dataclass
+class FitResult:
+    params: List[float]
+    rms: float
+    iterations: int
+    converged: bool
+
+
+def _model_single(p: Sequence[float], f_ghz: np.ndarray) -> np.ndarray:
+    return debye.single_debye(f_ghz, p[0], p[1], p[2], p[3], p[4])
+
+
+def _model_double(p: Sequence[float], f_ghz: np.ndarray) -> np.ndarray:
+    return debye.double_debye(f_ghz, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7])
+
+
+def _model_triple(p: Sequence[float], f_ghz: np.ndarray) -> np.ndarray:
+    return debye.triple_debye(f_ghz, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7])
+
+def _model_lorentz_single(p: Sequence[float], f_ghz: np.ndarray) -> np.ndarray:
+    return lorentz.single_lorentz(f_ghz, p[0], p[1], p[2], p[3], p[4])
+
+
+def _model_lorentz_double(p: Sequence[float], f_ghz: np.ndarray) -> np.ndarray:
+    return lorentz.double_lorentz(f_ghz, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7])
+
+
+def _model_debye_lorentz(p: Sequence[float], f_ghz: np.ndarray) -> np.ndarray:
+    # Debye+Lorentz: Fd, Dd, Gd, Fl, Dl, Gl, EPSV, SIGE
+    debye_part = debye.single_debye(f_ghz, p[0], p[1], 0.0, p[2], 0.0)
+    lorentz_part = lorentz.single_lorentz(f_ghz, p[3], p[4], 0.0, p[5], 0.0)
+    return p[6] + (debye_part - 0.0) + (lorentz_part - 0.0) - 1j * p[7] / (np.maximum(f_ghz, 1e-6) * debye.A0)
+
+def _rmse(model: np.ndarray, meas: np.ndarray) -> float:
+    diff = model - meas
+    return float(np.sqrt(np.mean(diff.real**2 + diff.imag**2)))
+
+
+def _initial_guess_single(f_ghz: np.ndarray, eps: np.ndarray) -> List[float]:
+    fres = float(f_ghz[np.argmax(np.abs(eps.imag))]) if len(f_ghz) else 1.0
+    epsr = eps.real
+    deps = float(max(epsr) - min(epsr)) if len(epsr) else 1.0
+    epsv = float(epsr[-1]) if len(epsr) else 1.0
+    gamma = 0.3
+    sige = 1e-4
+    return [fres, deps, epsv, gamma, sige]
+
+
+def _prepare_params(controls: Sequence[float], initial: List[float]) -> Tuple[List[float], List[bool]]:
+    params = initial[:]
+    fixed = [False] * len(initial)
+    for i, c in enumerate(controls[: len(initial)]):
+        if c > 0:
+            params[i] = 0.0 if abs(c - 1e-8) < 1e-12 else float(c)
+            fixed[i] = True
+        elif c < 0:
+            params[i] = abs(float(c))
+        # c == 0 -> keep heuristic initial
+    return params, fixed
+
+
+def _coord_descent(
+    params: List[float],
+    fixed: List[bool],
+    eval_model: Callable[[Sequence[float]], float],
+    max_iter: int = 250,
+    bounds: List[Tuple[float, float]] | None = None,
+) -> Tuple[List[float], float, int, bool]:
+    step = [max(abs(v) * 0.1, 1e-6) for v in params]
+    best = eval_model(params)
+    converged = False
+    for it in range(max_iter):
+        improved = False
+        for i in range(len(params)):
+            if fixed[i]:
+                continue
+            for delta in (step[i], -step[i]):
+                candidate = params[:]
+                candidate[i] += delta
+                if bounds:
+                    lo, hi = bounds[i]
+                    candidate[i] = max(min(candidate[i], hi), lo)
+                val = eval_model(candidate)
+                if val < best:
+                    best = val
+                    params = candidate
+                    improved = True
+                    break
+        # reduce step sizes if no improvement
+        if not improved:
+            step = [s * 0.5 for s in step]
+            if max(step) < 1e-6:
+                converged = True
+                break
+    return params, best, it + 1, converged
+
+
+def _initial_guess_bounds(controls: Sequence[float], defaults: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    bounds = []
+    for ctrl, (lo, hi) in zip(controls, defaults):
+        if ctrl > 0:
+            bounds.append((ctrl, ctrl))
+        else:
+            bounds.append((lo, hi))
+    return bounds
+
+
+def fit_debye_single(
+    f_ghz: Sequence[float],
+    eps_real: Sequence[float],
+    eps_imag: Sequence[float],
+    controls: Sequence[float] | None = None,
+) -> FitResult:
+    f = np.asarray(f_ghz, dtype=float)
+    eps = np.asarray(eps_real, dtype=float) + 1j * np.asarray(eps_imag, dtype=float)
+    init = _initial_guess_single(f, eps)
+    controls = controls or [0.0] * len(init)
+    params, fixed = _prepare_params(controls, init)
+
+    def objective(pvec: Sequence[float]) -> float:
+        model = _model_single(pvec, f)
+        return _rmse(model, eps)
+
+    params, rms, iters, conv = _coord_descent(params, fixed, objective)
+    return FitResult(params=params, rms=rms, iterations=iters, converged=conv)
+
+
+def fit_debye_double(
+    f_ghz: Sequence[float],
+    eps_real: Sequence[float],
+    eps_imag: Sequence[float],
+    controls: Sequence[float] | None = None,
+) -> FitResult:
+    f = np.asarray(f_ghz, dtype=float)
+    eps = np.asarray(eps_real, dtype=float) + 1j * np.asarray(eps_imag, dtype=float)
+    # Split single guess into two halves
+    g = _initial_guess_single(f, eps)
+    init = [g[0], g[1] * 0.6, g[3], g[0] * 0.5, g[1] * 0.4, g[3], g[2], g[4]]
+    controls = controls or [0.0] * len(init)
+    params, fixed = _prepare_params(controls, init)
+
+    def objective(pvec: Sequence[float]) -> float:
+        model = _model_double(pvec, f)
+        return _rmse(model, eps)
+
+    params, rms, iters, conv = _coord_descent(params, fixed, objective, max_iter=400)
+    return FitResult(params=params, rms=rms, iterations=iters, converged=conv)
+
+
+def fit_debye_triple(
+    f_ghz: Sequence[float],
+    eps_real: Sequence[float],
+    eps_imag: Sequence[float],
+    controls: Sequence[float] | None = None,
+) -> FitResult:
+    f = np.asarray(f_ghz, dtype=float)
+    eps = np.asarray(eps_real, dtype=float) + 1j * np.asarray(eps_imag, dtype=float)
+    g = _initial_guess_single(f, eps)
+    init = [
+        g[0],
+        g[1] * 0.5,
+        g[3],
+        g[0] * 0.6,
+        g[1] * 0.3,
+        g[3],
+        g[0] * 0.3,
+        g[1] * 0.2,
+        g[2],
+        g[4],
+    ]
+    controls = controls or [0.0] * len(init)
+    params, fixed = _prepare_params(controls, init)
+
+    def objective(pvec: Sequence[float]) -> float:
+        model = _model_triple(pvec, f)
+        return _rmse(model, eps)
+
+    params, rms, iters, conv = _coord_descent(params, fixed, objective, max_iter=500)
+    return FitResult(params=params, rms=rms, iterations=iters, converged=conv)
+
+
+def fit_lorentz_single(
+    f_ghz: Sequence[float],
+    eps_real: Sequence[float],
+    eps_imag: Sequence[float],
+    controls: Sequence[float] | None = None,
+) -> FitResult:
+    f = np.asarray(f_ghz, dtype=float)
+    eps = np.asarray(eps_real, dtype=float) + 1j * np.asarray(eps_imag, dtype=float)
+    # Fres, Deps, Epsv, Gamma, Sige
+    fres = float(f[np.argmax(np.abs(eps.imag))]) if len(f) else 1.0
+    deps = float(max(eps.real) - min(eps.real)) if len(eps) else 1.0
+    epsv = float(eps.real[-1]) if len(eps) else 1.0
+    gamma = 0.1
+    sige = 1e-6
+    init = [fres, deps, epsv, gamma, sige]
+    controls = controls or [0.0] * len(init)
+    params, fixed = _prepare_params(controls, init)
+
+    def objective(pvec: Sequence[float]) -> float:
+        model = _model_lorentz_single(pvec, f)
+        return _rmse(model, eps)
+
+    params, rms, iters, conv = _coord_descent(params, fixed, objective, max_iter=300)
+    return FitResult(params=params, rms=rms, iterations=iters, converged=conv)
+
+
+def fit_lorentz_double(
+    f_ghz: Sequence[float],
+    eps_real: Sequence[float],
+    eps_imag: Sequence[float],
+    controls: Sequence[float] | None = None,
+) -> FitResult:
+    f = np.asarray(f_ghz, dtype=float)
+    eps = np.asarray(eps_real, dtype=float) + 1j * np.asarray(eps_imag, dtype=float)
+    # Two peaks
+    fres1 = float(f[np.argmax(np.abs(eps.imag))]) if len(f) else 1.0
+    fres2 = fres1 * 0.3
+    deps1 = float(max(eps.real) - min(eps.real)) * 0.6 if len(eps) else 1.0
+    deps2 = deps1 * 0.5
+    epsv = float(eps.real[-1]) if len(eps) else 1.0
+    gamma1 = 0.1
+    gamma2 = 0.1
+    sige = 1e-6
+    init = [fres1, deps1, gamma1, fres2, deps2, gamma2, epsv, sige]
+    controls = controls or [0.0] * len(init)
+    params, fixed = _prepare_params(controls, init)
+
+    def objective(pvec: Sequence[float]) -> float:
+        model = _model_lorentz_double(pvec, f)
+        return _rmse(model, eps)
+
+    params, rms, iters, conv = _coord_descent(params, fixed, objective, max_iter=400)
+    return FitResult(params=params, rms=rms, iterations=iters, converged=conv)
+
+
+def fit_debye_lorentz(
+    f_ghz: Sequence[float],
+    eps_real: Sequence[float],
+    eps_imag: Sequence[float],
+    controls: Sequence[float] | None = None,
+) -> FitResult:
+    f = np.asarray(f_ghz, dtype=float)
+    eps = np.asarray(eps_real, dtype=float) + 1j * np.asarray(eps_imag, dtype=float)
+    # Hybrid guess: Debye around imag peak, Lorentz at lower freq
+    fresd = float(f[np.argmax(np.abs(eps.imag))]) if len(f) else 1.0
+    depsd = float(max(eps.real) - min(eps.real)) * 0.5 if len(eps) else 1.0
+    gammad = 0.2
+    fresl = fresd * 0.4
+    depsl = depsd * 0.5
+    gammal = 0.2
+    epsv = float(eps.real[-1]) if len(eps) else 1.0
+    sige = 1e-6
+    init = [fresd, depsd, gammad, fresl, depsl, gammal, epsv, sige]
+    controls = controls or [0.0] * len(init)
+    params, fixed = _prepare_params(controls, init)
+
+    def objective(pvec: Sequence[float]) -> float:
+        model = _model_debye_lorentz(pvec, f)
+        return _rmse(model, eps)
+
+    params, rms, iters, conv = _coord_descent(params, fixed, objective, max_iter=400)
+    return FitResult(params=params, rms=rms, iterations=iters, converged=conv)
+
+
+__all__ = [
+    "FitResult",
+    "fit_debye_single",
+    "fit_debye_double",
+    "fit_debye_triple",
+    # Lorentz / Debye-Lorentz
+    "fit_lorentz_single",
+    "fit_lorentz_double",
+    "fit_debye_lorentz",
+]
